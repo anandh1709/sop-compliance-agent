@@ -1,18 +1,23 @@
 # SOP Compliance Agent
 
-Multi-agent RAG system that **translates regulatory SOPs into structured workflow rules** and checks them against a compliance checklist. Built end-to-end in one evening as a working prototype.
+Multi-agent RAG system that extracts structured rules from regulatory Standard Operating Procedures and evaluates them against a compliance checklist. Built as a prototype to explore agent orchestration on domain documents.
 
-**Stack:** LangGraph · FAISS + Azure AI Search (swappable) · Groq · sentence-transformers · FastAPI · PyMuPDF · Pydantic
+**Stack:** LangGraph · FAISS · Azure AI Search · Groq · sentence-transformers · FastAPI · PyMuPDF · Pydantic
 
 ---
 
 ## What it does
 
-**Input:** an SOP (PDF upload or raw text).
+Given an SOP (PDF or raw text), the system:
 
-**Output:** structured JSON containing (a) `WorkflowRule` objects extracted from the SOP, each with a `trigger`, `action`, `deadline`, `responsible_party`, and `source_page`, and (b) a compliance check flagging which items in a predefined regulatory checklist are `satisfied`, `partial`, or `missing`, with citations back to the rule IDs that support each verdict.
+1. Chunks the document with paragraph-aware splitting
+2. Embeds and indexes chunks into a vector store (FAISS locally, or Azure AI Search)
+3. Runs a two-agent LangGraph pipeline:
+   - **Extractor agent** — reads retrieved chunks and produces structured rules with a `trigger`, `action`, `deadline`, `responsible_party`, and `source_page`
+   - **Checker agent** — evaluates each rule against a compliance checklist, returning `satisfied` / `partial` / `missing` with citations back to the rule IDs
+4. Serves the whole thing over a FastAPI endpoint with auto-generated Swagger UI
 
-Example — three sentences of raw SOP text in, six-item compliance verdict out:
+Example response for a three-sentence SOP text sent to `/check-compliance`:
 
 ```json
 {
@@ -40,6 +45,8 @@ Example — three sentences of raw SOP text in, six-item compliance verdict out:
 }
 ```
 
+Tested against the Johns Hopkins Medicine IRB "Essential Standard Operating Procedures" template — a real regulatory document with informed consent procedures, adverse event reporting deadlines, drug/device accountability rules, and protocol deviation reporting.
+
 ---
 
 ## Architecture
@@ -50,9 +57,9 @@ flowchart LR
         PDF[SOP PDF or text] --> Chunk[Paragraph-aware<br/>chunker]
     end
 
-    subgraph Index [Vector Store — swappable]
+    subgraph VectorStore [Vector store — swappable]
         FAISS[(FAISS<br/>local)]
-        Azure[(Azure AI Search<br/>prod)]
+        Azure[(Azure AI Search<br/>cloud)]
     end
 
     Chunk --> Embed[MiniLM<br/>embeddings]
@@ -69,12 +76,12 @@ flowchart LR
 
     Check --> API[FastAPI<br/>/check-compliance]
 
-    Checklist[Compliance checklist<br/>hardcoded → Dataverse in prod] --> Check
+    Checklist[Compliance checklist<br/>hardcoded for demo] --> Check
 ```
 
-The vector store is a swappable component. FAISS locally for zero-cost, offline dev; Azure AI Search for production because it handles scale, hybrid search, and integrates with SharePoint via Graph indexers — which is where regulated-industry SOPs actually live. Both backends implement the same `VectorStore` protocol; the API and agents don't know or care which is behind the interface.
+The vector store is a swappable component. FAISS runs locally with no external dependencies for offline dev; Azure AI Search is included as an alternative implementation of the same protocol. Both implementations use the same embedding model, so retrieval quality is consistent when swapping — verified during development by comparing the top-3 chunks returned for identical queries across backends.
 
-The LLM client (`GroqClient`) is similarly abstracted behind an `LLMClient` protocol. Swapping to OpenAI, Azure OpenAI, or Anthropic is a new implementation class, not a rewrite.
+The LLM client is similarly abstracted behind an `LLMClient` protocol. The current implementation targets Groq; adding another provider would be a new implementation class, not a rewrite.
 
 ---
 
@@ -83,26 +90,21 @@ The LLM client (`GroqClient`) is similarly abstracted behind an `LLMClient` prot
 Prerequisites: Python 3.10+, a [Groq API key](https://console.groq.com), and optionally an Azure AI Search resource on the Free tier.
 
 ```bash
-# Clone and enter
 git clone https://github.com/anandh1709/sop-compliance-agent.git
 cd sop-compliance-agent
 
-# Set up virtualenv
 python -m venv .venv
 source .venv/bin/activate            # macOS/Linux
 # .venv\Scripts\activate              # Windows
 
-# Install
 pip install -r requirements.txt
 
-# Configure — copy the template and fill in your Groq key
 cp .env.example .env
-# then edit .env
+# then edit .env with your Groq key (and optionally Azure keys)
 
-# Drop a sample SOP into data/ (any regulatory PDF works)
-# The demo used the Johns Hopkins IRB "Essential SOPs" template.
+# Drop a regulatory SOP PDF into data/sample_sop.pdf
+# The demo used the Johns Hopkins IRB Essential SOPs template.
 
-# Run the API
 uvicorn src.api:app --reload --port 8000
 ```
 
@@ -110,11 +112,11 @@ Then hit http://127.0.0.1:8000/docs for the interactive Swagger UI. The `/check-
 
 ### Backend selection
 
-Set `VECTOR_STORE_BACKEND=faiss` (default) or `VECTOR_STORE_BACKEND=azure` in `.env`. If `azure`, also set `AZURE_SEARCH_ENDPOINT` and `AZURE_SEARCH_KEY`. Same API, same request/response contract, different infrastructure underneath.
+Set `VECTOR_STORE_BACKEND=faiss` (default) or `VECTOR_STORE_BACKEND=azure` in `.env`. If `azure`, also set `AZURE_SEARCH_ENDPOINT` and `AZURE_SEARCH_KEY`. Same API contract, different infrastructure.
 
 ### Direct module smoke tests
 
-Each layer has its own smoke test — useful during development or for evaluating what's happening at each stage:
+Each layer has its own runnable smoke test:
 
 ```bash
 python -m src.ingest                       # PDF → chunks
@@ -129,23 +131,23 @@ python -m src.agents.graph                 # full LangGraph orchestration
 
 ## Design decisions & trade-offs
 
-**FAISS + Azure AI Search behind one interface.** FAISS keeps the dev loop tight and CI-friendly (no cloud dependencies to spin up). Azure AI Search gets used for production because it handles hybrid search (BM25 + vector), SharePoint indexer integration via Microsoft Graph, and scale. The `VectorStore` protocol makes the swap a config change.
+**Paragraph-aware chunking, ~500 words with 50-word overlap.** SOP rules typically live inside one or two paragraphs. Fixed-size chunking cuts sentences in half; recursive character splitting can under-chunk headings. Paragraph packing keeps rules semantically whole. The overlap prevents a rule that straddles a boundary from being lost by retrieval.
 
-**Client-side embeddings with MiniLM.** Both backends embed with `sentence-transformers/all-MiniLM-L6-v2` (384-dim). Fast and free during dev; means retrieval quality is identical when swapping backends (proven — Step 2b produces the same top-3 rankings as Step 2a for the same queries). Prod upgrade path: Azure AI Search's integrated vectorisation with Azure OpenAI `text-embedding-3-small` — no client compute, higher quality dimensions.
+**Two vector store implementations behind one protocol.** FAISS locally, Azure AI Search in the cloud. Both were exercised end-to-end during development. The abstraction meant the RAG loop, agents, and API were written once and worked against either backend — verified by running the same queries through both stores and comparing rankings.
 
-**Groq's `llama-3.1-8b-instant` for iteration.** Sub-second inference at temperature=0 is what makes multi-agent orchestration usable in a demo. The abstraction lets prod swap to Azure OpenAI GPT-4o or Anthropic Claude Sonnet without touching agent code.
+**Client-side embeddings with `all-MiniLM-L6-v2`.** 384 dimensions, fast on CPU, small enough to cache. Retrieval quality is identical across FAISS and Azure since both embed with the same model. A stronger embedding model (e.g. `bge-large-en-v1.5`) or a domain-specific one would be the obvious quality upgrade.
 
-**LangGraph for two nodes.** Arguably overkill — the extractor and checker could be sequential function calls. But making state explicit and typed means adding a third agent later (human-in-the-loop review, a rewriter for ambiguous rules) is a graph edge, not a rewrite. The abstraction earns its keep the moment the graph grows.
+**Groq's `llama-3.1-8b-instant` for the agents.** Sub-second inference at temperature=0 makes multi-agent orchestration feel snappy in a demo. The `LLMClient` abstraction means swapping to a larger model or a different provider is a config change.
 
-**Pydantic validation at every LLM boundary.** JSON mode occasionally produces structurally-wrong output — missing fields, wrong types. Pydantic catches this at the boundary between the LLM and the pipeline, so failures are loud and debuggable rather than silent and downstream.
+**LangGraph for two agents.** Two nodes could be sequential function calls. Using LangGraph makes state explicit and typed, which pays off the moment the graph grows — adding a third agent (e.g. a rewriter for ambiguous rules, or a human-in-the-loop reviewer) is a graph edge, not a refactor.
 
-**Grounding over fluency.** The RAG system prompt explicitly requires the model to say *"the provided SOP does not cover this"* when retrieved context doesn't answer the question. Tested by throwing an out-of-scope medical dosage question at it — the model refused rather than hallucinating a plausible-sounding answer. In regulated contexts, groundedness is worth more than eloquence.
+**Pydantic validation at every LLM boundary.** JSON mode occasionally produces structurally-wrong output. Pydantic catches this at the boundary between the LLM and the pipeline, so failures are loud and debuggable rather than silent and downstream.
 
-**Hardcoded checklist for the demo.** The compliance checklist is a list of six strings in `src/checklist.py` — drawn from ICH-GCP E6(R2) and 21 CFR Part 312. In production this lives in Dataverse: one row per requirement per market, with severity, framework, and applicable SOP types. The checker pulls the relevant subset at runtime. Same code path.
+**Grounding over fluency.** The RAG system prompt requires the model to say *"the provided SOP does not cover this"* when retrieved context doesn't answer the question. Tested by throwing an out-of-scope medical dosage question at it — the model refused rather than hallucinating a plausible-sounding answer. In regulated contexts this matters more than eloquence.
 
-**Rate-limit awareness.** Hit Groq's free-tier TPM cap during the first end-to-end run. Fixed by (a) capping retrieved chunks at 8 after query-union dedup rather than sending everything, and (b) pacing checker calls with a short sleep. Prod path: paid tier or Azure OpenAI reserved throughput, plus `asyncio.gather` for parallel independent checker calls.
+**Rate-limit awareness during development.** Hit Groq's free-tier tokens-per-minute cap on the first end-to-end run. Fixed by (a) capping retrieved chunks at 8 after query-union dedup rather than sending everything to the extractor, and (b) pacing the sequential checker calls. Sequential is fine for a demo; the six checker calls are independent so `asyncio.gather` would parallelise them cleanly.
 
-**Deliberately no auth on the API.** This is a prototype; adding OAuth2 / API-key headers is a small step but muddies the demo. In production the API would sit behind Azure API Management or similar.
+**Deliberately no auth on the API.** This is a prototype focused on the RAG and agent logic. Adding auth would be a separate concern.
 
 ---
 
@@ -153,13 +155,13 @@ python -m src.agents.graph                 # full LangGraph orchestration
 
 Ordered by value, not effort.
 
-- **SharePoint + Microsoft Graph ingestion.** Replace the local `data/sample_sop.pdf` with a Graph API pull from a nominated SharePoint site — customers of the target use case already keep SOPs there. New source, same downstream pipeline.
-- **Dataverse sink for extracted rules.** Push the `WorkflowRule` objects to a Dataverse table with columns matching the schema. A Power Automate flow can then route each rule to a reviewer or auto-provision workflow steps in the customer's existing process.
-- **Evals with RAGAs.** Build a gold-standard set of SOP → expected-rules and SOP → expected-verdict pairs. Track faithfulness and answer-relevance in CI so retriever + prompt tweaks are safe.
-- **Hybrid search on the Azure backend.** Combine BM25 keyword scoring with vector similarity. Azure AI Search does this natively — pass `search_text=query` alongside the vector query. Adds keyword precision without giving up semantic recall.
-- **Parallelise the checker.** The six checklist items are independent. `asyncio.gather` cuts wall time roughly 6× on the checker stage. Requires making `LLMClient.generate_json` async.
-- **RBAC via Azure Entra ID.** Currently uses admin API keys. Prod would use Managed Identity + the Search Index Data Contributor role — no secrets in `.env`.
-- **Dockerise.** One `Dockerfile`, one `docker-compose.yml`, and `docker compose up` boots the whole stack. Cuts prototype deployment time from "clone, venv, install, configure" to a single command.
+- **Evals.** Build a small gold-standard set of SOP → expected-rules and SOP → expected-verdict pairs, and use RAGAs to track faithfulness and answer relevance across prompt or model changes. Right now iteration is by eyeball.
+- **Parallelise the checker.** Six independent LLM calls run sequentially. `asyncio.gather` cuts wall time roughly 6×. Requires making `LLMClient.generate_json` async.
+- **Persist FAISS across API restarts.** Currently the store is rebuilt per request. Persist per `sop_id` and reuse across sessions — cuts re-embedding cost for repeat SOPs.
+- **Hybrid search on Azure.** Azure AI Search supports combining BM25 keyword scoring with vector similarity in one query. Vector alone can miss the right chunk on rare regulatory phrases; adding BM25 catches those.
+- **Streaming responses.** The graph blocks for ~25 seconds. Stream extracted rules as they're produced, then stream check results as they land — LangGraph's `astream_events` covers this without restructuring nodes.
+- **Managed Identity for Azure.** Currently uses admin API keys read from `.env`. Managed Identity plus the Search Index Data Contributor role is the production approach — no secrets in env files.
+- **Dockerise.** One Dockerfile, one docker-compose file, and `docker compose up` boots the whole stack.
 
 ---
 
