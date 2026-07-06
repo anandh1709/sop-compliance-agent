@@ -4,8 +4,6 @@ src/agents/extractor.py
 Agent 1: reads retrieved SOP chunks and extracts discrete
 WorkflowRule objects.
 
-This is the "translate SOPs into workflow rules" part of the JD,
-made literal.
 """
 from typing import List
 
